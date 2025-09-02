@@ -1,0 +1,550 @@
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+
+// --- Tipos e Constantes ---
+
+type BabyStats = {
+  level: number;
+  xp: number;
+};
+
+type CareAction = {
+  id: string;
+  label: string;
+  pointsGain: number;
+  xpGain: number;
+  unlockLevel: number; // Nível para desbloquear
+  emoji: string;
+};
+
+type Descendant = {
+  id: number;
+  generation: number;
+  name: string;
+  baseRate: number;
+};
+
+type UpgradeType = "care" | "passive" | "xp" | "auto" | "happiness" | "combo" | "spark";
+
+type Upgrade = {
+  id: string;
+  name: string;
+  description: string;
+  baseCost: number;
+  type: UpgradeType;
+};
+
+type Achievement = {
+  id: string;
+  title: string;
+  description: string;
+  unlocked: boolean;
+};
+
+type GameEvent = {
+  type: "positive" | "negative" | "neutral";
+  title: string;
+  description: string;
+  duration: number; // Duração em segundos
+};
+
+const careActions: CareAction[] = [
+  { id: "feed", label: "Alimentar", pointsGain: 10, xpGain: 8, unlockLevel: 1, emoji: "🍼" },
+  { id: "play", label: "Brincar", pointsGain: 15, xpGain: 12, unlockLevel: 5, emoji: "🧸" },
+  { id: "teach", label: "Ensinar", pointsGain: 22, xpGain: 18, unlockLevel: 10, emoji: "📚" },
+];
+
+const storeUpgrades: Upgrade[] = [
+  { id: "care_boost", name: "Carinho Extra", description: "+15% pontos por ação.", baseCost: 250, type: "care" },
+  { id: "passive_boost", name: "Lar Confortável", description: "+20% renda passiva.", baseCost: 400, type: "passive" },
+  { id: "xp_boost", name: "Curso para Pais", description: "+20% experiência.", baseCost: 350, type: "xp" },
+  { id: "auto_nanny", name: "Babá Autônoma", description: "+10 pts/s automáticos.", baseCost: 600, type: "auto" },
+  { id: "happiness_boost", name: "Memórias Afetivas", description: "Aumenta o bônus de felicidade.", baseCost: 500, type: "happiness" },
+  { id: "combo_boost", name: "Ritmo Acelerado", description: "Aumenta o bônus de combo.", baseCost: 450, type: "combo" },
+  { id: "spark_chance", name: "Sorte de Principiante", description: "Aumenta a chance de Chispas.", baseCost: 800, type: "spark" },
+];
+
+const NEXT_GENERATION_LEVEL_REQ = 20;
+
+// --- Funções Utilitárias ---
+
+const getLevelThreshold = (level: number): number => 70 + (level - 1) * 35;
+const formatNumber = (value: number): string => value.toLocaleString("pt-BR");
+
+const computeBabyProgress = (
+  baby: BabyStats,
+  xpGain: number
+): { updatedBaby: BabyStats; levelUps: number } => {
+  let xpTotal = baby.xp + xpGain;
+  let level = baby.level;
+  let levelUps = 0;
+  let threshold = getLevelThreshold(level);
+
+  while (xpTotal >= threshold) {
+    xpTotal -= threshold;
+    level += 1;
+    levelUps += 1;
+    threshold = getLevelThreshold(level);
+  }
+
+  return { updatedBaby: { level, xp: xpTotal }, levelUps };
+};
+
+const usePrevious = <T,>(value: T): T | undefined => {
+  const ref = useRef<T>();
+  useEffect(() => {
+    ref.current = value;
+  }, [value]);
+  return ref.current;
+};
+
+// --- Componente Principal ---
+
+const HomePage: React.FC = () => {
+  // --- Estados ---
+  const [points, setPoints] = useState<number>(0);
+  const [totalEarned, setTotalEarned] = useState<number>(0);
+  const [baby, setBaby] = useState<BabyStats>({ level: 1, xp: 0 });
+  const [descendants, setDescendants] = useState<Descendant[]>([]);
+  const [generation, setGeneration] = useState<number>(0);
+  const [investmentLevel, setInvestmentLevel] = useState<number>(0);
+  const [purchases, setPurchases] = useState<Record<string, number>>({});
+  const [legacyTokens, setLegacyTokens] = useState<number>(0);
+  const [logEntries, setLogEntries] = useState<string[]>([]);
+  const [unlockedAchievementIds, setUnlockedAchievementIds] = useState<string[]>([]);
+  const [happiness, setHappiness] = useState<number>(70);
+  const [comboCount, setComboCount] = useState<number>(0);
+  const [flashMessage, setFlashMessage] = useState<string | null>(null);
+  const [activeEvent, setActiveEvent] = useState<{ event: GameEvent; timeLeft: number } | null>(null);
+
+  // --- Refs ---
+  const comboTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastActionTimeRef = useRef<number>(0);
+
+  // --- Cálculos de Bônus e Multiplicadores ---
+  const careMultiplierBonus = useMemo(() => (purchases["care_boost"] ?? 0) * 0.15, [purchases]);
+  const xpMultiplierBonus = useMemo(() => (purchases["xp_boost"] ?? 0) * 0.20, [purchases]);
+  const passiveMultiplierBonus = useMemo(() => (purchases["passive_boost"] ?? 0) * 0.20, [purchases]);
+  const autoPointsPerSecond = useMemo(() => (purchases["auto_nanny"] ?? 0) * 10, [purchases]);
+  const happinessMultiplier = useMemo(() => (purchases["happiness_boost"] ?? 0) * 0.05, [purchases]);
+  const comboMultiplier = useMemo(() => (purchases["combo_boost"] ?? 0) * 0.05, [purchases]);
+  const sparkChanceBonus = useMemo(() => (purchases["spark_chance"] ?? 0) * 0.02, [purchases]);
+
+  const legacyMultiplier = useMemo(() => 1 + legacyTokens * 0.4, [legacyTokens]);
+  const investmentCareBonus = useMemo(() => investmentLevel * 0.15, [investmentLevel]);
+  const investmentPassiveBonus = useMemo(() => investmentLevel * 0.12, [investmentLevel]);
+  const investmentXpBonus = useMemo(() => investmentLevel * 0.12, [investmentLevel]);
+
+  const comboBonus = useMemo(() => 1 + comboCount * (0.08 + comboMultiplier), [comboCount, comboMultiplier]);
+  const happinessBonus = useMemo(() => 1 + happiness / (120 - happinessMultiplier * 100), [happiness, happinessMultiplier]);
+
+  const basePassive = useMemo(() => {
+    const descendantRate = descendants.reduce((sum, child) => sum + child.baseRate, 0);
+    const babyBonus = Math.max(0, baby.level - 2) * 2;
+    const generationBonus = generation * 3;
+    return descendantRate + babyBonus + generationBonus;
+  }, [descendants, baby.level, generation]);
+
+  const eventPassiveModifier = activeEvent?.event.type === "negative" ? 0.5 : 1;
+
+  const effectivePassive = useMemo(() => Math.round(
+    (basePassive * (1 + passiveMultiplierBonus + investmentPassiveBonus) + autoPointsPerSecond) * legacyMultiplier * eventPassiveModifier
+  ), [basePassive, passiveMultiplierBonus, investmentPassiveBonus, autoPointsPerSecond, legacyMultiplier, eventPassiveModifier]);
+
+  // --- Funções de UI ---
+  const pushLog = useCallback((message: string) => {
+    setLogEntries((previous) => [`[${new Date().toLocaleTimeString()}] ${message}`, ...previous].slice(0, 5));
+  }, []);
+
+  const triggerFlash = useCallback((message: string) => {
+    setFlashMessage(message);
+    setTimeout(() => setFlashMessage(null), 2500);
+  }, []);
+
+  // --- Game Loop Principal (Game Tick) ---
+  useEffect(() => {
+    const gameTick = () => {
+      const tickRate = 0.5; // Roda a cada 500ms
+      setPoints((prev) => prev + effectivePassive * tickRate);
+      setTotalEarned((prev) => prev + effectivePassive * tickRate);
+      setHappiness((prev) => Math.max(0, prev - 0.5 * tickRate));
+
+      if (activeEvent) {
+        setActiveEvent(curr => {
+          if (!curr) return null;
+          const newTimeLeft = curr.timeLeft - tickRate;
+          if (newTimeLeft <= 0) {
+            pushLog(`O evento "${curr.event.title}" terminou.`);
+            return null;
+          }
+          return { ...curr, timeLeft: newTimeLeft };
+        });
+      }
+    };
+    const interval = setInterval(gameTick, 500);
+    return () => clearInterval(interval);
+  }, [effectivePassive, activeEvent, pushLog]);
+
+  // --- Lógica de Eventos Aleatórios ---
+  const triggerRandomEvent = useCallback(() => {
+    if (activeEvent) return; // Não aciona se já houver um evento
+
+    const possibleEvents: GameEvent[] = [
+      { type: "positive", title: "Salto de Desenvolvimento", description: "Seu bebê teve uma revelação! Ganho extra de XP.", duration: 10 },
+      { type: "negative", title: "Noite Inquieta", description: "O bebê não dormiu bem. A felicidade cai e a renda passiva é reduzida.", duration: 30 },
+      { type: "neutral", title: "Visita da Família", description: "Sua família veio visitar e trouxe um presente em pontos!", duration: 15 },
+    ];
+    const randomEvent = possibleEvents[Math.floor(Math.random() * possibleEvents.length)];
+    
+    setActiveEvent({ event: randomEvent, timeLeft: randomEvent.duration });
+    triggerFlash(`Novo Evento: ${randomEvent.title}!`);
+    pushLog(`Evento: ${randomEvent.title}!`);
+
+    switch (randomEvent.type) {
+      case "positive":
+        const xpBonus = 50 + baby.level * 10;
+        setBaby(b => computeBabyProgress(b, xpBonus).updatedBaby);
+        pushLog(`+${xpBonus} de XP bônus!`);
+        break;
+      case "negative":
+        setHappiness(h => Math.max(0, h - 25));
+        break;
+      case "neutral":
+        const pointsBonus = 500 + generation * 100;
+        setPoints(p => p + pointsBonus);
+        pushLog(`+${formatNumber(Math.floor(pointsBonus))} pontos de presente!`);
+        break;
+    }
+  }, [baby.level, generation, pushLog, triggerFlash, activeEvent]);
+
+  useEffect(() => {
+    const eventInterval = setInterval(triggerRandomEvent, 90000); // A cada 90 segundos
+    return () => clearInterval(eventInterval);
+  }, [triggerRandomEvent]);
+
+  // --- Lógica de Ações do Jogador ---
+  const handleCare = useCallback((action: CareAction) => {
+    const now = Date.now();
+    if (now - lastActionTimeRef.current <= 3500) {
+      setComboCount((previous) => previous + 1);
+    } else {
+      setComboCount(1);
+    }
+    lastActionTimeRef.current = now;
+
+    if (comboTimeoutRef.current) clearTimeout(comboTimeoutRef.current);
+    comboTimeoutRef.current = setTimeout(() => setComboCount(0), 3500);
+
+    const sparkTriggered = Math.random() < (0.05 + sparkChanceBonus);
+    const sparkMultiplier = sparkTriggered ? 2.5 : 1;
+
+    const totalPointsMultiplier = (1 + careMultiplierBonus + investmentCareBonus) * happinessBonus * comboBonus * legacyMultiplier * sparkMultiplier;
+    const totalXpMultiplier = (1 + xpMultiplierBonus + investmentXpBonus) * happinessBonus * legacyMultiplier;
+
+    const pointsEarned = Math.round(action.pointsGain * totalPointsMultiplier);
+    const xpEarned = Math.round(action.xpGain * totalXpMultiplier);
+
+    const { updatedBaby, levelUps } = computeBabyProgress(baby, xpEarned);
+    setBaby(updatedBaby);
+
+    if (levelUps > 0) {
+      pushLog(`Bebê chegou ao nível ${updatedBaby.level}!`);
+      triggerFlash("Crescimento incrível!");
+    }
+
+    if (sparkTriggered) triggerFlash("Chispas de alegria! Pontos x2.5!");
+
+    setPoints((previous) => previous + pointsEarned);
+    setTotalEarned((previous) => previous + pointsEarned);
+    setHappiness((previous) => Math.min(100, previous + 12));
+    pushLog(`Você cuidou: +${formatNumber(pointsEarned)} pts.`);
+  }, [baby, careMultiplierBonus, investmentCareBonus, happinessBonus, comboBonus, legacyMultiplier, xpMultiplierBonus, investmentXpBonus, sparkChanceBonus, pushLog, triggerFlash]);
+
+  const nextGenerationCost = useMemo(() => Math.round((800 + generation * 450) * (1 + generation * 0.25)), [generation]);
+  const canAdvanceGeneration = useMemo(() => baby.level >= NEXT_GENERATION_LEVEL_REQ, [baby.level]);
+
+  const handleNextGeneration = useCallback(() => {
+    if (!canAdvanceGeneration) {
+      pushLog(`Chegue ao nível ${NEXT_GENERATION_LEVEL_REQ} para evoluir.`);
+      return;
+    }
+    if (points < nextGenerationCost) {
+      pushLog("Pontos insuficientes para a nova geração.");
+      return;
+    }
+
+    const nextGeneration = generation + 1;
+    const descendantRate = Math.round((12 + nextGeneration * 5) * legacyMultiplier);
+    const newDescendant: Descendant = { id: Date.now(), generation: nextGeneration, name: `Filho G${nextGeneration}`, baseRate: descendantRate };
+
+    setPoints((previous) => previous - nextGenerationCost + 100 + nextGeneration * 40);
+    setDescendants((previous) => [...previous, newDescendant]);
+    setGeneration(nextGeneration);
+    setBaby({ level: 1, xp: 0 });
+    setHappiness((previous) => Math.min(100, previous + 25));
+    triggerFlash("Nova geração desbloqueada!");
+    pushLog(`Geração ${nextGeneration} rende ${formatNumber(descendantRate)} pts/s.`);
+  }, [points, canAdvanceGeneration, nextGenerationCost, generation, legacyMultiplier, pushLog, triggerFlash]);
+
+  const investCost = useMemo(() => Math.round((500 + investmentLevel * 200) * (1 + investmentLevel * 0.15)), [investmentLevel]);
+
+  const handleInvest = useCallback(() => {
+    if (points < investCost) {
+      pushLog("Pontos insuficientes para investir.");
+      return;
+    }
+    setPoints((previous) => previous - investCost);
+    setInvestmentLevel((previous) => previous + 1);
+    triggerFlash("Investimento concluído!");
+    pushLog("A família ficou mais eficiente.");
+  }, [points, investCost, pushLog, triggerFlash]);
+
+  const handlePurchaseUpgrade = useCallback((upgrade: Upgrade) => {
+    const quantity = purchases[upgrade.id] ?? 0;
+    const cost = Math.round(upgrade.baseCost * Math.pow(1.5, quantity));
+
+    if (points < cost) {
+      pushLog("Pontos insuficientes para a melhoria.");
+      return;
+    }
+
+    setPoints((previous) => previous - cost);
+    setPurchases((previous) => ({ ...previous, [upgrade.id]: quantity + 1 }));
+    triggerFlash(`${upgrade.name} (Nível ${quantity + 1}) adquirido!`);
+    pushLog(`${upgrade.name} comprado.`);
+  }, [points, purchases, pushLog, triggerFlash]);
+
+  const canActivateLegacy = useMemo(() => generation >= 3 && descendants.length >= 3 && totalEarned >= 50000, [generation, descendants, totalEarned]);
+
+  const handleLegacyReset = useCallback(() => {
+    if (!canActivateLegacy) {
+      pushLog("Construa mais a linhagem antes do legado.");
+      return;
+    }
+    const confirmation = typeof window !== "undefined" ? window.confirm("Ativar legado? Progresso atual será reiniciado, mas você ganhará um bônus permanente.") : false;
+    if (!confirmation) return;
+
+    setLegacyTokens((previous) => previous + 1);
+    setPoints(0);
+    setTotalEarned(0);
+    setBaby({ level: 1, xp: 0 });
+    setDescendants([]);
+    setGeneration(0);
+    setInvestmentLevel(0);
+    setPurchases({});
+    setHappiness(70);
+    triggerFlash("Legado ativado! Multiplicador permanente garantido.");
+    pushLog("Legado ativado! Recomece mais forte.");
+  }, [canActivateLegacy, pushLog, triggerFlash]);
+
+  // --- Cálculos para a UI ---
+  const xpNeeded = useMemo(() => getLevelThreshold(baby.level), [baby.level]);
+  const progressPercent = useMemo(() => Math.min(100, Math.round((baby.xp / xpNeeded) * 100)), [baby.xp, xpNeeded]);
+
+  // --- Lógica de Conquistas ---
+  const achievements: Achievement[] = useMemo(() => [
+      { id: "level_ten", title: "Nível 10", description: "Alcance o nível 10.", unlocked: baby.level >= 10 },
+      { id: "invest_master", title: "Investidor", description: "Faça 5 investimentos.", unlocked: investmentLevel >= 5 },
+      { id: "family_tree", title: "Família", description: "Tenha 3 descendentes.", unlocked: descendants.length >= 3 },
+      { id: "fortune", title: "Riqueza", description: "Ganhe 100.000 pontos.", unlocked: totalEarned >= 100000 },
+      { id: "legacy", title: "Legado", description: "Ative o legado.", unlocked: legacyTokens >= 1 },
+    ], [baby.level, investmentLevel, descendants.length, totalEarned, legacyTokens]);
+
+  const previousAchievements = usePrevious(unlockedAchievementIds);
+
+  useEffect(() => {
+    const currentUnlockedIds = achievements.filter((a) => a.unlocked).map((a) => a.id);
+    const newlyUnlocked = currentUnlockedIds.filter((id) => !(previousAchievements ?? []).includes(id));
+
+    if (newlyUnlocked.length > 0) {
+      newlyUnlocked.forEach((id) => {
+        const achievement = achievements.find((item) => item.id === id);
+        if (achievement) {
+          pushLog(`Conquista: ${achievement.title}!`);
+          triggerFlash(`Conquista: ${achievement.title}!`);
+        }
+      });
+      setUnlockedAchievementIds(currentUnlockedIds);
+    }
+  }, [achievements, previousAchievements, pushLog, triggerFlash]);
+
+  const milestones = useMemo(() => {
+    const nextGenReq = `Nível ${NEXT_GENERATION_LEVEL_REQ} do bebê.`;
+    const nextGenerationGoal = canActivateLegacy
+      ? "Ative o legado para multiplicadores permanentes."
+      : `Próxima geração: ${nextGenReq}`;
+    const happinessStatus = happiness >= 70 ? "Radiante" : happiness >= 40 ? "Feliz" : "Precisa de atenção";
+    return { nextGenerationGoal, happinessStatus };
+  }, [canActivateLegacy, happiness]);
+
+  // --- JSX ---
+  return (
+    <main className="h-screen overflow-hidden bg-gradient-to-br from-pink-100 via-indigo-100 to-blue-100 font-sans">
+      <div className="mx-auto flex h-full max-w-7xl flex-col gap-4 px-4 py-4 sm:px-6 sm:py-6">
+        <header className="flex flex-wrap items-center justify-between gap-4 rounded-3xl bg-white/90 px-6 py-4 shadow-lg backdrop-blur-sm">
+          <div>
+            <h1 className="text-3xl font-extrabold text-indigo-600">Linhas do Amor</h1>
+            <p className="text-sm text-gray-600">Sua jornada familiar de crescimento e legado.</p>
+          </div>
+          <div className="flex gap-2 sm:gap-4 text-xs sm:text-sm text-gray-700">
+            <div className="rounded-2xl bg-indigo-50 px-3 py-2">
+              Combo: <span className="font-semibold">x{comboBonus.toFixed(2)}</span>
+            </div>
+            <div className="rounded-2xl bg-green-50 px-3 py-2">
+              Felicidade: <span className="font-semibold">{Math.floor(happiness)}%</span>
+            </div>
+            <div className="rounded-2xl bg-purple-50 px-3 py-2">
+              Legado: <span className="font-semibold">x{legacyMultiplier.toFixed(2)}</span>
+            </div>
+          </div>
+        </header>
+
+        {flashMessage && (
+          <div className="pointer-events-none fixed top-5 left-0 right-0 z-50 flex justify-center">
+            <div className="animate-bounce rounded-full bg-yellow-300 px-6 py-3 text-sm font-semibold text-yellow-900 shadow-2xl">
+              {flashMessage}
+            </div>
+          </div>
+        )}
+
+        <section className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+          <article className="rounded-3xl bg-white/90 p-4 text-center shadow-lg backdrop-blur-sm">
+            <p className="text-xs font-semibold text-gray-500">Pontos</p>
+            <p className="text-2xl font-bold text-indigo-600">{formatNumber(Math.floor(points))}</p>
+          </article>
+          <article className="rounded-3xl bg-white/90 p-4 text-center shadow-lg backdrop-blur-sm">
+            <p className="text-xs font-semibold text-gray-500">Renda Passiva</p>
+            <p className="text-2xl font-bold text-indigo-600">{formatNumber(effectivePassive)} /s</p>
+          </article>
+          <article className="rounded-3xl bg-white/90 p-4 text-center shadow-lg backdrop-blur-sm">
+            <p className="text-xs font-semibold text-gray-500">Geração</p>
+            <p className="text-2xl font-bold text-indigo-600">{generation}</p>
+          </article>
+          <article className="rounded-3xl bg-white/90 p-4 text-center shadow-lg backdrop-blur-sm">
+            <p className="text-xs font-semibold text-gray-500">Total Acumulado</p>
+            <p className="text-2xl font-bold text-indigo-600">{formatNumber(Math.floor(totalEarned))}</p>
+          </article>
+        </section>
+
+        <section className="grid flex-1 grid-cols-1 gap-4 lg:grid-cols-3 overflow-hidden">
+          <article className="flex flex-col gap-4 rounded-3xl bg-white/90 p-5 shadow-lg backdrop-blur-sm">
+            <div className="flex items-center gap-3">
+              <div className="flex h-16 w-16 items-center justify-center rounded-2xl border-2 border-dashed bg-gray-100 text-4xl">
+                👶
+              </div>
+              <div>
+                <h2 className="text-xl font-semibold text-indigo-600">Seu Bebê</h2>
+                <p className="text-sm text-gray-600">Nível {baby.level} • {milestones.happinessStatus}</p>
+              </div>
+            </div>
+            <div className="space-y-2">
+              <div className="flex justify-between text-xs text-gray-600">
+                <span>Experiência</span>
+                <span>{formatNumber(Math.floor(baby.xp))}/{formatNumber(xpNeeded)}</span>
+              </div>
+              <div className="h-3 w-full rounded-full bg-gray-200"><div className="h-3 rounded-full bg-indigo-500 transition-all duration-500" style={{ width: `${progressPercent}%` }} /></div>
+            </div>
+            <div className="grid grid-cols-3 gap-3">
+              {careActions.map((action) => {
+                const isUnlocked = baby.level >= action.unlockLevel;
+                return (
+                  <button key={action.id} onClick={() => handleCare(action)} disabled={!isUnlocked} title={isUnlocked ? action.label : `Desbloqueia no Nível ${action.unlockLevel}`} className="flex flex-col items-center justify-center gap-1 rounded-2xl bg-indigo-50 p-3 text-center text-xs font-semibold text-gray-700 transition hover:bg-indigo-100 focus:outline-none focus:ring-2 focus:ring-indigo-400 disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed">
+                    <span className="text-2xl" aria-hidden>{isUnlocked ? action.emoji : "🔒"}</span>
+                    {action.label}
+                    {isUnlocked && <span className="text-[10px] text-indigo-600">+{action.pointsGain} pts</span>}
+                  </button>
+                );
+              })}
+            </div>
+            <div className="mt-auto grid grid-cols-3 gap-3 text-xs font-semibold text-white">
+              <button onClick={handleInvest} disabled={points < investCost} className="rounded-2xl bg-green-500 py-3 transition hover:bg-green-600 focus:outline-none focus:ring-2 focus:ring-green-400 disabled:bg-gray-400 disabled:cursor-not-allowed">
+                Investir<span className="block text-[10px] font-normal">{formatNumber(investCost)} pts</span>
+              </button>
+              <button onClick={handleNextGeneration} disabled={!canAdvanceGeneration} className="rounded-2xl py-3 transition focus:outline-none focus:ring-2 disabled:bg-gray-400 disabled:cursor-not-allowed bg-purple-500 hover:bg-purple-600 focus:ring-purple-400">
+                Nova Geração<span className="block text-[10px] font-normal">{formatNumber(nextGenerationCost)} pts</span>
+              </button>
+              <button onClick={handleLegacyReset} disabled={!canActivateLegacy} className="rounded-2xl py-3 transition focus:outline-none focus:ring-2 disabled:bg-gray-400 disabled:cursor-not-allowed bg-yellow-500 hover:bg-yellow-600 focus:ring-yellow-400">
+                Legado
+              </button>
+            </div>
+          </article>
+
+          <article className="flex flex-col gap-4 rounded-3xl bg-white/90 p-5 shadow-lg backdrop-blur-sm overflow-y-auto">
+            <div>
+              <h2 className="text-lg font-semibold text-indigo-600">Melhorias da Família</h2>
+              <p className="text-xs text-gray-600">Invista em bônus permanentes.</p>
+            </div>
+            <ul className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+              {storeUpgrades.map((upgrade) => {
+                const quantity = purchases[upgrade.id] ?? 0;
+                const cost = Math.round(upgrade.baseCost * Math.pow(1.5, quantity));
+                return (
+                  <li key={upgrade.id} className="flex flex-col gap-2 rounded-2xl bg-indigo-50 p-3">
+                    <div>
+                      <p className="text-sm font-semibold text-indigo-700">{upgrade.name}</p>
+                      <p className="text-[11px] text-gray-600">{upgrade.description}</p>
+                    </div>
+                    <div className="mt-auto flex items-center justify-between pt-2 text-[11px] text-gray-700">
+                      <span>Nível: {quantity}</span>
+                      <button onClick={() => handlePurchaseUpgrade(upgrade)} disabled={points < cost} className="rounded-lg bg-indigo-600 px-2 py-1 font-semibold text-white transition hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-400 disabled:bg-gray-400 disabled:cursor-not-allowed">
+                        {formatNumber(cost)}
+                      </button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+            <div className="mt-auto rounded-2xl bg-indigo-50 p-4 text-sm text-gray-700">
+              <p className="font-semibold text-indigo-700">Próximo Grande Passo</p>
+              <p>{milestones.nextGenerationGoal}</p>
+            </div>
+          </article>
+
+          <article className="flex flex-col gap-4 rounded-3xl bg-white/90 p-5 shadow-lg backdrop-blur-sm overflow-y-auto">
+            {activeEvent && (
+              <div className={`rounded-2xl p-3 ${activeEvent.event.type === 'negative' ? 'bg-red-100' : 'bg-yellow-100'}`}>
+                <h2 className={`text-sm font-semibold ${activeEvent.event.type === 'negative' ? 'text-red-800' : 'text-yellow-800'}`}>{activeEvent.event.title}</h2>
+                <p className="text-xs text-gray-700">{activeEvent.event.description}</p>
+                <div className="mt-1 h-1 w-full rounded-full bg-gray-300"><div className="h-1 rounded-full bg-yellow-500" style={{ width: `${(activeEvent.timeLeft / activeEvent.event.duration) * 100}%` }} /></div>
+              </div>
+            )}
+            <div className="grid grid-cols-2 gap-3">
+              <div className="rounded-2xl bg-indigo-50 p-3">
+                <h2 className="text-sm font-semibold text-indigo-700">Descendentes</h2>
+                {descendants.length === 0 ? (
+                  <p className="mt-2 text-xs text-gray-600">Avance de geração para criar uma linhagem.</p>
+                ) : (
+                  <ul className="mt-2 space-y-1 text-xs text-gray-700">
+                    {descendants.slice(0, 4).map((child) => (
+                      <li key={child.id}>G{child.generation}: {formatNumber(Math.round(child.baseRate * (1 + passiveMultiplierBonus + investmentPassiveBonus) * legacyMultiplier))} pts/s</li>
+                    ))}
+                    {descendants.length > 4 && <li>+{descendants.length - 4} outros...</li>}
+                  </ul>
+                )}
+              </div>
+              <div className="rounded-2xl bg-indigo-50 p-3">
+                <h2 className="text-sm font-semibold text-indigo-700">Conquistas</h2>
+                <div className="mt-2 grid grid-cols-2 gap-2 text-center text-[11px]">
+                  {achievements.map((a) => (
+                    <div key={a.id} title={a.description} className={`rounded-xl px-2 py-2 ${a.unlocked ? "bg-green-200 text-green-900" : "bg-gray-200 text-gray-600"}`}>{a.title}</div>
+                  ))}
+                </div>
+              </div>
+            </div>
+            <div className="rounded-2xl bg-indigo-50 p-3 mt-auto">
+              <h2 className="text-sm font-semibold text-indigo-700">Eventos Recentes</h2>
+              {logEntries.length === 0 ? (
+                <p className="mt-2 text-xs text-gray-600">Cuide do bebê para ver os destaques aqui.</p>
+              ) : (
+                <ul className="mt-2 space-y-1 text-xs text-gray-700">
+                  {logEntries.map((entry, index) => (<li key={index}>• {entry}</li>))}
+                </ul>
+              )}
+            </div>
+          </article>
+        </section>
+      </div>
+    </main>
+  );
+};
+
+export
